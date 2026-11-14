@@ -26,16 +26,20 @@ class DataValidationError(PipelineError):
 class DataTransformationError(PipelineError):
     pass 
 
+class DataSaveError(PipelineError):
+    pass 
+
 
 ### SET UP LOGGING DIRECTORY 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def setup_logging(config):
     """READ IN THE LOGGING SETTINGS FROM CONFIG FILE"""
-    log_config = config.get('logging',{})
+    log_config = config.get('logging')
     log_level = getattr(logging, log_config.get('level', 'INFO'))
-    log_dir = os.path.join(SCRIPT_DIR, log_config.get('level', 'INFO'))
-    log_file = config.get('log_file',{})
+    log_dir = os.path.join(SCRIPT_DIR, log_config.get('log_dir', 'INFO'))
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = log_config.get('log_file')
     os.makedirs(os.path.dirname(log_dir), exist_ok=True)
     logging.basicConfig(
                         level=log_level,
@@ -85,50 +89,72 @@ def retry(max_retries = 3, delay = 2):
 
 @retry(max_retries=3, delay = 2)
 def load_data(file_path, logger):
-    """LOAD ALL THE DATA INTO A DATAFRAME"""
-    logger.info('---STEP 1 : LOAD DATA---')
     
-    if not os.path.exists(file_path):
-        raise DataLoadError(f"File directory not found at : {file_path}")
-    
-    logger.info(f"Reading files from {file_path}....")
-    logger.info(f"Total Files in directory : {len([file for file in os.listdir(file_path)])}")
-    logger.info(f"Beginning file merge")
-    df = pd.concat([pd.read_csv(''.join(rf"{file_path}/{file}")) for file in os.listdir(file_path)])
-    df = df.drop(["", 'puuid'])
-    logger.info(f"File merge successful!")
-    logger.info(f"Collated data has {df.shape[0]}rows and {df.shape[1]} columns")
-    print(len(df))
-    logger.info('---STEP 1 : COMPLETE---')
+    try:
+        """LOAD ALL THE DATA INTO A DATAFRAME"""
+        logger.info("=" * 30)
+        logger.info('---STEP 1 : LOAD DATA---')
+        logger.info("=" * 30)
+        if not os.path.exists(file_path):
+            raise DataLoadError(f"File directory not found at : {file_path}")
+        
+        logger.info(f"Reading files from {file_path}....")
+        logger.info(f"Total Files in directory : {len([file for file in os.listdir(file_path)])}")
+        logger.info(f"Beginning file merge")
+        df = pd.concat([pd.read_csv(''.join(rf"{file_path}/{file}")) for file in os.listdir(file_path)])
+        logger.info(f"File merge successful!")
+        logger.info(f"Collated data has {df.shape[0]} rows and {df.shape[1]} columns")
+        logger.info('---STEP 1 : COMPLETE---')
+        
+    except DataLoadError as e:
+        logger.error(f'A data validation error occurred : {e}')
+        raise
+    except Exception:
+        logging.exception("Unexpected Error has ocurred.")
+        raise
+    return df
         
         
 def data_validation(df, config, logger):
     """VALIDATE EVERYTHING INCOMING AND ENSURE ITS COMPLETE AND VALID"""
-    logger.info('---STEP 2 : VALIDATE INCOMING DATA---')
-    cleaning = config.get('cleaning', {})
-    required = config.get('required_columns', {})
-    
-    missing_cols = [col for col in required if col not in df.columns]
-    if missing_cols:
-        logger.error('Required data is missing from data asset')
-        raise DataValidationError(f"Missing data : {missing_cols}")
-    
-    logger.info('Required data validated...')
-    
-    logger.info('Checking data quality...')
-    null_count = df.isnull().sum().sum()
-    duplicate_count = df.duplicated.sum()
-    dtype_count = {df.dtypes.value_counts()}
-    logger.info(f'data contains {null_count} nulls...')
-    logger.info(f'data contains {duplicate_count} duplicates...')
-    logger.info(f'data type counts... {dtype_count}...')
+    try:
+        logger.info("=" * 30)
+        logger.info('---STEP 2 : VALIDATE INCOMING DATA---')
+        logger.info("=" * 30)
+        cleaning = config.get('cleaning', {})
+        required = config.get('required_columns', {})
+        
+        missing_cols = [col for col in required if col not in df.columns]
+        if missing_cols:
+            logger.error('Required data is missing from data asset')
+            raise DataValidationError(f"Missing data : {missing_cols}")
+        
+        logger.info('Required data validated...')
+        
+        logger.info('Checking data quality...')
+        null_count = df.isnull().sum().sum()
+        duplicate_count = df.duplicated().sum()
+        dtype_count = df.dtypes.value_counts().to_json()
+        logger.info(f'data contains {null_count} nulls...')
+        logger.info(f'data contains {duplicate_count} duplicates...')
+        logger.info(f'data type counts...')
+        logger.info(dtype_count)
+    except DataValidationError as e:
+        logger.error(f'A data validation error occurred : {e}')
+        logging.exception("message")
+        raise
+    except Exception:
+        logging.exception("message")
+        raise
     
     return df
     
     
 def data_cleaning(df, config, logger):
     """CLEAN THE INCOMING DATA"""
+    logger.info("=" * 30)
     logger.info('---STEP 3 : CLEAN INCOMING DATA---')
+    logger.info("=" * 30)
     initial_rows = len(df)
     
     try:
@@ -148,6 +174,8 @@ def data_cleaning(df, config, logger):
         
         # STEP 3 REMOVE ANY JUNK
         row_count = len(df)
+        logger.info('Dropping unnamed first col...')
+        df=df.iloc[::,1::]
         df = df[df['timePlayed']>= min_game_time]
         logger.info(f'Identified {row_count - len(df)} invalid games')
         
@@ -161,67 +189,82 @@ def data_cleaning(df, config, logger):
             if df[col].dtype in ('str', 'object') and col != 'riotIdGameName' :
                 df[col] = df[col].str.strip().str.title()
                 df[col] = df[col].replace(['None', 'Nan', ''], np.nan)
-                df[col] = df.fillna('Unknown')
-                logger.info(f'Text for {df[col]} have been standardised...')
+                df[col] = df[col].fillna('Unknown')
+                logger.info(f'String values for {col} have been standardised...')
         
             if  df[col].dtype == 'int':
                 df[col] = df[col].astype('int64')
-                df[col] = df.fillna(0)
-                logger.info(f'Numeric values for {df[col]} have been standardised...')
+                df[col] = df[col].fillna(0)
+                logger.info(f'Numeric values for {col} have been standardised...')
         logger.info('Columns have been cleaned...')
+
                 
     except DataTransformationError as e:
         return logger.error(f'Error cleaning data : {e}')
     
+    except Exception:
+        logging.exception("Unexpected Error has ocurred.")
+        raise
     return df
         
 def enrich_data(df, logger):
     """ADD SOME ADDITIONAL METRICS TO THE DATAFRAME"""
-    logger.info(f'Calculating additional metrics...')
-    df['KDRatio'] = np.nan_to_num(np.divide(df['kills'], df['deaths']), nan=0)
-    df['KDARatio'] = np.nan_to_num(np.divide(df['kills'] + df['assists'], df['deaths']), nan=0)
-    df['WardsPerMinute'] = np.nan_to_num(np.divide(df['wardsPlaced'], df['timePlayed']), nan=0)
-    logger.info(f'Additional metrics added...')
+    try :
+    
+        logger.info("=" * 30)
+        logger.info(f'Calculating additional metrics...')
+        logger.info("=" * 30)
+        df['KDRatio'] = np.nan_to_num(np.divide(df['kills'], df['deaths']), nan=0)
+        df['KDARatio'] = np.nan_to_num(np.divide(df['kills'] + df['assists'], df['deaths']), nan=0)
+        df['WardsPerMinute'] = np.nan_to_num(np.divide(df['wardsPlaced'], df['timePlayed']), nan=0)
+        logger.info(f'Additional metrics added...')
+        
+    except DataTransformationError as e:
+        logger.error(f'A data validation error occurred : {e}')
+        raise
+    except Exception:
+        logging.exception("Unexpected Error has ocurred.")
+        raise
     return df
     
 def generate_summary(df, logger):
     """GENERATE A SUMMARY OF EVERYTHING THAT HAS BEEN LOADED"""
     logger.info(f'Loading summary of games processed...')
-    logger.info(f'Processed a total of {df['matchId'].nunique} games...')  
-    
-    logger.info(f'Loading summary of games processed by player...')
-    logger.info({df.groupby('riotIdGameName').agg(game_count=("matchId", "nunique")).sort_values})            
+    logger.info(f'Processed a total of {df['matchId'].nunique()} games...')      
     return df
     
 
 def save_output(df, config, logger): 
-    """SAVING THE COLLATED DATA INTO ONE LOCATION"""
-    output_directory = os.path.join(SCRIPT_DIR, config.get('data', {}).get('output_dir', 'output'))
-    os.makedirs(output_directory, exist_ok=True)
-    time = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = os.path.join(output_directory, f'cleaned_league_game_data_{time}.csv')
-    df.to_csv(output_file, index=False)
-    logger.info(f'Saved output file to {output_file}')
-    logger.info(f'File contains {len(df)} rows...')
-    return output_file
+    try :
+        """SAVING THE COLLATED DATA INTO ONE LOCATION"""
+        output_directory = os.path.join(SCRIPT_DIR, config.get('data', {}).get('output_dir', 'output'))
+        os.makedirs(output_directory, exist_ok=True)
+        time = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = os.path.join(output_directory, f'cleaned_league_game_data_{time}.csv')
+        df.to_csv(output_file, index=False)
+        logger.info(f'Saved output file to {output_file}')
+        logger.info(f'File contains {len(df)} rows...')
+    except DataSaveError as e:
+        logger.error(f'An error occurred saving the data: {e}')
+    except Exception:
+        logging.exception("Unexpected Error has ocurred.")
     
-df = pd.concat([pd.read_csv(rf'data\{csv_file}') for csv_file in os.listdir('data')])
-print(df['matchId'].nunique())
-
-
-
+    return df
+    
 
 ### MAIN PIPELINE
 
 def run_pipeline():
-    
-    start_time = time.time()
     configuration = load_config()
     logger = setup_logging(configuration)
+
+    start_time = time.time()
+    start_time_local = time.strftime('%y-%m-%d %H:%S', time.localtime())
+    logger.info(f'Pipeline initiatied at {start_time_local}')
     logger.info("=" * 30)
     logger.info("Starting data pipeline...")
     logger.info("=" * 30)
-    logger.info(f'Pipeline initiatied at {start_time}')
+
     try:
         data_config = configuration.get('data', {})
         input_dir = data_config.get('input_dir', 'data')
@@ -230,14 +273,17 @@ def run_pipeline():
         df=load_data(filepath, logger)
         df=data_validation(df, data_config, logger)
         df=data_cleaning(df, data_config, logger)
-        df=enrich_data(df,data_config, logger)
-        df=generate_summary(df,data_config, logger)
+        df=enrich_data(df, logger)
+        df=generate_summary(df, logger)
         df=save_output(df,data_config, logger)
-        return df
-    
     except PipelineError as e:
         logger.error(f'Error {e}')
         
     end_time = time.time()
-    logger.info(f'Pipeline completed at {end_time}')
-    logger.info(f'Total job time {(end_time - start_time):.2f}')
+    end_time_local = time.strftime('%Y-%m-%d %H:%S', time.localtime())
+    logger.info(f'Pipeline completed at {end_time_local}')
+    logger.info(f'Total job time {(end_time - start_time):.2f} seconds')
+    return df
+    
+if __name__ == "__main__":
+    run_pipeline()
